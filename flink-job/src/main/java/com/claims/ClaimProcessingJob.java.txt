@@ -1,0 +1,116 @@
+package com.ramsusa.claims;
+
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+public class ClaimProcessingJob {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        String bootstrapServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+
+        KafkaSource<String> ingestSource = KafkaSource.<String>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setTopics("claim.ingest.raw")
+                .setGroupId("claim-ingest-group")
+                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .build();
+
+        KafkaSink<String> validatedSink = buildSink(bootstrapServers, "claim.validated");
+        KafkaSink<String> errorSink = buildSink(bootstrapServers, "claim.errors");
+        KafkaSink<String> holdSink = buildSink(bootstrapServers, "claim.hold");
+        KafkaSink<String> processedSink = buildSink(bootstrapServers, "claim.processed");
+
+        DataStream<String> rawClaims = env.fromSource(
+                ingestSource,
+                WatermarkStrategy.noWatermarks(),
+                "ClaimIngestSource"
+        );
+
+        DataStream<String> validatedOrError = rawClaims.map(json -> {
+            ObjectNode node = (ObjectNode) MAPPER.readTree(json);
+
+            boolean ok = true;
+            StringBuilder errors = new StringBuilder();
+
+            if (!node.hasNonNull("claimId")) {
+                ok = false;
+                errors.append("claimId missing; ");
+            }
+            if (!node.hasNonNull("customerId")) {
+                ok = false;
+                errors.append("customerId missing; ");
+            }
+            double amount = node.path("amount").asDouble(0.0);
+            if (amount <= 0) {
+                ok = false;
+                errors.append("amount must be positive; ");
+            }
+
+            if (!ok) {
+                ObjectNode err = MAPPER.createObjectNode();
+                err.put("claimId", node.path("claimId").asText(""));
+                err.put("errors", errors.toString());
+                return MAPPER.writeValueAsString(err) + "::ERROR";
+            }
+
+            return json + "::VALID";
+        });
+
+        DataStream<String> errors = validatedOrError
+                .filter(s -> s.endsWith("::ERROR"))
+                .map(s -> s.replace("::ERROR", ""));
+
+        DataStream<String> validated = validatedOrError
+                .filter(s -> s.endsWith("::VALID"))
+                .map(s -> s.replace("::VALID", ""));
+
+        DataStream<String> enriched = validated.map(json -> {
+            ObjectNode node = (ObjectNode) MAPPER.readTree(json);
+            double amount = node.path("amount").asDouble(0.0);
+            double fraudScore = amount > 10000 ? 0.9 : (amount > 5000 ? 0.6 : 0.2);
+            node.put("fraudScore", fraudScore);
+            return MAPPER.writeValueAsString(node);
+        });
+
+        DataStream<String> toHold = enriched.filter(json -> {
+            ObjectNode node = (ObjectNode) MAPPER.readTree(json);
+            return node.path("fraudScore").asDouble(0.0) > 0.8;
+        });
+
+        DataStream<String> toProcessed = enriched.filter(json -> {
+            ObjectNode node = (ObjectNode) MAPPER.readTree(json);
+            return node.path("fraudScore").asDouble(0.0) <= 0.8;
+        });
+
+        errors.sinkTo(errorSink).name("ErrorSink");
+        validated.sinkTo(validatedSink).name("ValidatedSink");
+        toHold.sinkTo(holdSink).name("HoldSink");
+        toProcessed.sinkTo(processedSink).name("ProcessedSink");
+
+        env.execute("Claim Processing Flink Job");
+    }
+
+    private static KafkaSink<String> buildSink(String bootstrapServers, String topic) {
+        return KafkaSink.<String>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(
+                        KafkaRecordSerializationSchema.builder()
+                                .setTopic(topic)
+                                .setValueSerializationSchema(new SimpleStringSchema())
+                                .build()
+                )
+                .build();
+    }
+}
